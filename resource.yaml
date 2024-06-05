@@ -455,8 +455,7 @@ Resources:
               sudo mv 3d.flf /usr/share/figlet/
               aws cloud9 update-environment --environment-id $C9_PID --managed-credentials-action DISABLE &> /dev/null
               su -l -c 'wget https://raw.githubusercontent.com/berry2012/amazon-ecs-demo/main/demo.sh' ec2-user
-              su -l -c 'mv demo.sh /home/ec2-user/environment' ec2-user              
-              su -l -c 'echo "alias olademo='figlet -f 3d Demo Time | lolcat'" >> /home/ec2-user/.bashrc' ec2-user
+              su -l -c 'mv demo.sh /home/ec2-user/environment' ec2-user
               echo '=== PREPARE REBOOT in 1 minute with at ==='
               shutdown -r 1
               '''.format(
