@@ -4,7 +4,7 @@
 
 export REGION=$(aws ec2 describe-availability-zones --output text --query 'AvailabilityZones[0].[RegionName]')
 export ENVIRONMENT_NAME="ecs-bootcamp"
-export CONTAINER_NAME="runtime-demo"
+export CONTAINER_NAME="bootcamp-app"
 
 export ECS_VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true --query 'Vpcs[].VpcId' --output text --region $REGION)
 
@@ -49,7 +49,16 @@ cat << EOF > runtime.json
                 },
                 "linuxParameters": {
                     "initProcessEnabled": true
-                }                                 
+                },
+                "healthCheck": {
+                    "command": [
+                        "CMD-SHELL",
+                        "curl -f http://localhost/ || exit 1"
+                    ],
+                    "interval": 5,
+                    "timeout": 3,
+                    "retries": 2
+                }                
             }
         ],
         "requiresCompatibilities": [
