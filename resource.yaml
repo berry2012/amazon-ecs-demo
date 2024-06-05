@@ -1,0 +1,921 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Amazon ECS and AWS Fargate Operational Bootcamp - LAB
+  Security on ECS and Fargate Best practices.
+
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: Default VPC
+  VpcCIDR: 
+    Type: String
+    Default: 172.31.0.0/16
+    Description: Default VPC CIDR
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: Choose Public Subnet in AZ 1
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Choose Public Subnet in AZ 2   
+  
+  LaunchType:
+    Type: String
+    Default: Fargate
+    AllowedValues:
+      - Fargate
+      - EC2
+    Description: >
+      The launch type for your service. Selecting EC2 will create an Auto
+      Scaling group of m5.large instances for your cluster. See
+      https://docs.aws.amazon.com/AmazonECS/latest/developerguide/launch_types.html
+      to learn more about launch types.
+
+  InstanceType:
+    Type: String
+    Default: m5.large
+
+  LatestECSOptimizedAMI:
+    Description: ECS AMI ID
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id
+
+Conditions:
+  EC2: !Equals [ !Ref LaunchType, "EC2" ]
+  Fargate: !Equals [ !Ref LaunchType, "Fargate" ]
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterLabels:
+      LaunchType:
+        default: "Launch Type"
+    ParameterGroups:
+      - Label:
+          default: Cluster Configuration
+        Parameters:
+          - LaunchType
+
+Resources:
+  ECSInstancesSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: "Security group for the instances"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - CidrIp: !Ref VpcCIDR
+          IpProtocol: -1
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "TCP"
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "TCP"
+          FromPort: 443
+          ToPort: 443            
+
+  ECSServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: "Security group for the service"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - CidrIp: !Ref VpcCIDR
+          IpProtocol: -1
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "TCP"
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "TCP"
+          FromPort: 443
+          ToPort: 443            
+
+  ECSTaskLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: !Sub lambda.${AWS::URLSuffix}
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy      
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - autoscaling:*
+                Resource: "*"                
+              - Effect: Allow
+                Action:
+                  - iam:*
+                Resource: "*"
+          PolicyName: RunECSTask-Lambda-Policy
+
+  ECSServiceLinkedRoleFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt ECSTaskLambdaRole.Arn
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+          import json
+          from botocore.exceptions import ClientError
+
+          def handler(event, context):
+              print("REQUEST RECEIVED: \n" + json.dumps(event))          
+              if event['RequestType'] == 'Delete':   
+                  print("## We don't need to delete ECS Service Linked Role")   
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  print('Checking if service role exist..')
+                  try:
+                     client = boto3.client('iam')
+                     response = client.get_role(
+                         RoleName='AWSServiceRoleForECS'
+                     )
+                     result = json.dumps(response["Role"]["Arn"], indent=4, sort_keys=True, default=str)
+                     print(f"ECS Service Linked Role Already Exist.")
+                     print(f"Role Arn: ", result)
+                     cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                     return                     
+                  except ClientError as e:
+                     print(f"Error: ", e)
+                     print(f"We will create a new Service role for Amazon ECS")
+                     new_role = client.create_service_linked_role(
+                         AWSServiceName='ecs.amazonaws.com',
+                         Description='A new Service role for Amazon ECS',
+                     )
+                     new_role = json.dumps(new_role["Role"]["RoleName"], indent=4, sort_keys=True, default=str)
+                     cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                         'RoleName': new_role
+                     })
+                     return               
+              except Exception as err:
+                  print(err)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})                      
+
+  ECSServiceLinkedRoleFunctionCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ECSServiceLinkedRoleFunction.Arn
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    # Condition: EC2
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    # Condition: EC2
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2Role
+
+  Cloud9Environment:
+    Type: AWS::Cloud9::EnvironmentEC2
+    Properties:
+      Description: Amazon ECS Troubleshooting Immersion Day
+      InstanceType: c5.large
+      AutomaticStopTimeMinutes: 60
+      ImageId: resolve:ssm:/aws/service/cloud9/amis/amazonlinux-2-x86_64
+
+  Cloud9InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub ec2.${AWS::URLSuffix}
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  Cloud9InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Cloud9InstanceRole
+
+  Cloud9RoleAttacherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: !Sub lambda.${AWS::URLSuffix}
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt Cloud9InstanceRole.Arn
+          PolicyName: UpdateEC2InstanceProfile
+
+  Cloud9RoleAttacherFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt Cloud9RoleAttacherRole.Arn
+      Runtime: python3.9
+      Handler: index.handler
+      Timeout: 600
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+          import json
+          import os
+          import time          
+
+          def handler(event, context):
+              print("REQUEST RECEIVED: \n" + json.dumps(event))
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  client = boto3.client('ec2')
+                  response = client.describe_instances(
+                      Filters=[{
+                          'Name': 'tag:aws:cloud9:environment',
+                          'Values': [
+                              event['ResourceProperties']['Cloud9EnvironmentId']
+                          ]
+                      }]
+                  )
+                  instance = response['Reservations'][0]['Instances'][0]
+                  instance_id = instance['InstanceId']
+                  security_group_id = instance['NetworkInterfaces'][0]['Groups'][0]['GroupId']
+                  print('Instance ID: ' + instance_id);
+                  print('Security Group ID: ' + security_group_id);
+
+                  # Wait for Instance to become ready before adding Role
+                  instance_state = instance['State']['Name']
+                  print("Instance State: ", instance_state)
+                  while instance_state != 'running':
+                      time.sleep(30)
+                      instance_state = client.describe_instances(InstanceIds=[instance['InstanceId']])
+
+                  response = client.describe_iam_instance_profile_associations(
+                      Filters=[{
+                          'Name': 'instance-id',
+                          'Values': [instance_id]
+                      }]
+                  )
+                  associations = response['IamInstanceProfileAssociations']
+                  if len(associations) == 1:
+                      association_id = associations[0]['AssociationId']
+                      response = client.disassociate_iam_instance_profile(
+                        AssociationId=association_id
+                      )
+                  client.associate_iam_instance_profile(
+                      IamInstanceProfile={
+                        'Arn': event['ResourceProperties']['InstanceProfileArn']
+                      },
+                      InstanceId=instance_id
+                  )
+
+                  ### Reboot the instance for SSM agent to be running
+                  response = client.describe_instances(
+                      Filters=[{
+                          'Name': 'tag:aws:cloud9:environment',
+                          'Values': [
+                              event['ResourceProperties']['Cloud9EnvironmentId']
+                          ]
+                      }]
+                  )
+                  instance = response['Reservations'][0]['Instances'][0]
+                  instance_id = instance['InstanceId']
+                  instance_state = instance['State']['Name']
+                  while instance_state == 'running':
+                      time.sleep(10)
+                      response = client.reboot_instances(
+                          InstanceIds=[
+                              instance_id,
+                          ],
+                      )
+                      time.sleep(60)
+                      instance_state = client.describe_instances(InstanceIds=[instance['InstanceId']])
+                      print("Instance State: ", instance_state, "Rebooting instance now")
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'SecurityGroupId': security_group_id
+                  })
+              except Exception as err:
+                  print(err)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  Cloud9RoleAttacherCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: Cloud9RoleAttacherRole    
+    Properties:
+      ServiceToken: !GetAtt Cloud9RoleAttacherFunction.Arn
+      Cloud9EnvironmentId: !Ref Cloud9Environment
+      InstanceProfileArn: !GetAtt Cloud9InstanceProfile.Arn
+
+  RunCommandLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: !Sub ssm.${AWS::URLSuffix}
+          Action: sts:AssumeRole
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${RunCommandLogGroup.Arn}:*"
+          PolicyName: Cloud9Initialize
+
+  EC2InitializerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: !Sub lambda.${AWS::URLSuffix}
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:*
+                  - ec2:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt SSMRole.Arn
+          PolicyName: Cloud9Initialize
+
+  Cloud9InitializerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: 
+    - Cloud9RoleAttacherFunction 
+    - Cloud9RoleAttacherCustomResource
+    Properties:
+      Role: !GetAtt EC2InitializerRole.Arn
+      Runtime: python3.9
+      Handler: index.handler
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+          import json
+
+          def handler(event, context):
+              print("REQUEST RECEIVED: \n" + json.dumps(event))
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  client = boto3.client('ec2')
+                  response = client.describe_instances(
+                      Filters=[{
+                          'Name': 'tag:aws:cloud9:environment',
+                          'Values': [
+                              event['ResourceProperties']['Cloud9EnvironmentId']
+                          ]
+                      }]
+                  )
+                  instance = response['Reservations'][0]['Instances'][0]
+                  instance_id = instance['InstanceId']
+                  commands = '''
+              yum install jq -y &> /dev/null
+              yum install figlet -y &> /dev/null
+              pip install lolcat &> /dev/null 
+              sudo yum install -y https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm
+              wget https://raw.githubusercontent.com/xero/figlet-fonts/master/3d.flf
+              sudo mv 3d.flf /usr/share/figlet/
+              aws cloud9 update-environment --environment-id $C9_PID --managed-credentials-action DISABLE &> /dev/null
+              su -l -c 'wget https://raw.githubusercontent.com/berry2012/amazon-ecs-demo/main/demo.sh' ec2-user
+              su -l -c 'mv demo.sh /home/ec2-user/environment' ec2-user              
+              su -l -c 'echo "alias olademo='figlet -f 3d Demo Time | lolcat'" >> /home/ec2-user/.bashrc' ec2-user
+              echo '=== PREPARE REBOOT in 1 minute with at ==='
+              shutdown -r 1
+              '''.format(
+                      region=event['ResourceProperties']['Region'],
+                      instance_role_arn=event['ResourceProperties']['InstanceRoleArn'],
+                      instance_id=instance_id,
+                      account_id=event['ResourceProperties']['AccountId'],
+                      cloud9environment_id=event['ResourceProperties']['Cloud9EnvironmentId'],
+                  ).split("\n")
+                  client = boto3.client('ssm')
+                  client.send_command(
+                      DocumentName='AWS-RunShellScript',
+                      DocumentVersion='$LATEST',
+                      InstanceIds=[instance_id],
+                      TimeoutSeconds=60,
+                      ServiceRoleArn=event['ResourceProperties']['SsmRoleArn'],
+                      CloudWatchOutputConfig={
+                          'CloudWatchLogGroupName': event['ResourceProperties']['LogGroupName'],
+                          'CloudWatchOutputEnabled': True
+                      },
+                      Parameters={
+                          'commands': commands
+                      }
+                  )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as err:
+                  print(err)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  Cloud9Initializer:
+    Type: AWS::CloudFormation::CustomResource 
+    Properties:
+      ServiceToken: !GetAtt Cloud9InitializerFunction.Arn
+      Cloud9EnvironmentId: !Ref Cloud9Environment
+      SsmRoleArn: !GetAtt SSMRole.Arn
+      LogGroupName: !Ref RunCommandLogGroup
+      AccountId: !Sub "${AWS::AccountId}"
+      Region: !Sub "${AWS::Region}"
+      InstanceRoleArn: !GetAtt Cloud9InstanceRole.Arn
+
+  EC2Cluster:
+    DependsOn: 
+    - ECSServiceLinkedRoleFunction
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: EC2Cluster
+      Configuration:
+        ExecuteCommandConfiguration:
+            Logging: DEFAULT   
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Purpose
+          Value: Troubleshooting               
+
+  FargateCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: FargateCluster
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1      
+      Configuration:
+        ExecuteCommandConfiguration:
+            Logging: DEFAULT   
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Purpose
+          Value: Troubleshooting  
+        - Key: Session
+          Value: Advanced
+
+
+  AutoScalingGroup:
+    DependsOn: EC2Cluster
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MinSize: '2'
+      MaxSize: '3'
+      DesiredCapacity: '2'
+      VPCZoneIdentifier: 
+       - !Ref PublicSubnet1
+       - !Ref PublicSubnet2       
+      Tags: 
+        - Key: Name
+          Value: EC2Cluster
+          PropagateAtLaunch: true
+        - Key: Purpose
+          Value: Troubleshooting
+          PropagateAtLaunch: true          
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT15M
+        WaitOnResourceSignals: true
+
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            01_add_instance_to_cluster:
+                command: !Sub echo ECS_CLUSTER=${EC2Cluster} > /etc/ecs/ecs.config
+          files:
+            "/etc/cfn/cfn-hup.conf":
+              mode: 000400
+              owner: root
+              group: root
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.ContainerInstances.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource LaunchConfiguration
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+    Properties:
+      ImageId: !Ref LatestECSOptimizedAMI
+      InstanceType: m5.large
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroups:
+        - !Ref ECSInstancesSecurityGroup
+      UserData:
+        "Fn::Base64": !Sub |
+          #!/bin/bash
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource LaunchConfiguration
+          /opt/aws/bin/cfn-signal -e $? --region ${AWS::Region} --stack ${AWS::StackName} --resource AutoScalingGroup
+
+  RoleForECS:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2008-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: ecs.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceRole'
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        - arn:aws:iam::aws:policy/SecretsManagerReadWrite
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: ssm-sensitive-secret-ecs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 'secretsmanager:GetSecretValue'
+                Resource: '*'   
+              - Effect: Allow
+                Action: 'kms:Decrypt'
+                Resource: '*'       
+              - Effect: Allow
+                Action: 'ssmmessages:*'
+                Resource: '*'  
+              - Effect: Allow
+                Action: 'ssm:*'
+                Resource: '*'        
+              - Effect: Allow
+                Action: 'ecr-public:*'
+                Resource: '*'                                                                 
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${AWS::StackName}
+      RetentionInDays: 14
+
+  TestSecret:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: my-token
+      Description: "This secret has a dynamically generated secret password."
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "test-user"}'
+        GenerateStringKey: "password"
+        PasswordLength: 30
+        ExcludeCharacters: '"@/\'
+      Tags:
+        -
+          Key: Purpose
+          Value: Troubleshooting
+
+  BasicParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: apisecret
+      Type: String
+      Value: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+      Description: SSM parameter of type String.
+
+  FargateTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: fargate-simple-app
+      RequiresCompatibilities:
+        - "FARGATE"
+      Memory: 512
+      Cpu: 256
+      NetworkMode: "awsvpc"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: simple-app
+          Image: nginx:latest
+          Essential: true
+          LinuxParameters: 
+            InitProcessEnabled: true          
+          HealthCheck:
+              Command:
+                  - "CMD-SHELL"
+                  - "curl -f http://localhost/ || exit 1"
+              Interval: 5
+              Retries: 2
+              Timeout: 3          
+          MountPoints:
+            - SourceVolume: my-vol
+              ContainerPath: /usr/share/nginx/html
+          PortMappings:
+            - ContainerPort: 80
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: 'Secret_Access_key'
+              Value: "je7MtGbClwBF/2Zp9Utk/h3yCo8nvbEXAMPLEKEY"    
+          Secrets:
+            - Name: 'secretmanager_token'
+              ValueFrom: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:my-token'        
+            - Name: 'parameterstore_token'
+              ValueFrom: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/apisecret'
+        - Name: busybox
+          Image: busybox
+          EntryPoint:
+            - sh
+            - -c
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: ecs        
+          Environment:
+            - Name: 'PROJECT'
+              Value: "ECS TROUBLESHOOTING"     
+          VolumesFrom:
+            - SourceContainer: simple-app
+          Command:
+            - >-
+              /bin/sh -c "while true; do echo '<html> <head> <title>Amazon ECS
+              Sample App</title> <style>body {margin-top: 40px;
+              background-color: #333;} </style> </head><body> <div
+              style=color:white;text-align:center> <h1>Amazon ECS Sample
+              App</h1> <h2>Congratulations!</h2> <p>Your application is now
+              running on a container in Amazon ECS.</p>' > top; /bin/date > date
+              ; echo '</div></body></html>' > bottom; cat top date bottom >
+              /usr/share/nginx/html/index.html ; echo $PROJECT > /usr/share/nginx/html/variable.html; sleep 10; done"
+      Volumes:
+        - Name: my-vol
+
+  FargateService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref FargateCluster
+      ServiceName: frontend-app
+      DesiredCount: 1
+      TaskDefinition: !Ref FargateTaskDefinition
+      EnableExecuteCommand: true
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ECSServiceSecurityGroup
+          Subnets: 
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+      Tags: 
+        - Key: Purpose
+          Value: AdvTroubleshooting
+      PropagateTags: SERVICE
+
+
+  EC2TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: TestSecret
+    Properties:
+      Family: ec2-simple-app-new
+      RequiresCompatibilities:
+        - "EC2"
+      NetworkMode: "bridge"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: simple-app-ec2
+          Image: nginx:latest
+          Essential: true
+          LinuxParameters: 
+            InitProcessEnabled: true    
+          Memory: 512      
+          HealthCheck:
+              Command:
+                  - "CMD-SHELL"
+                  - "curl -f http://localhost/ || exit 1"
+              Interval: 5
+              Retries: 2
+              Timeout: 3          
+          MountPoints:
+            - SourceVolume: my-vol
+              ContainerPath: /usr/share/nginx/html
+          PortMappings:
+            - ContainerPort: 80
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: ecs
+        - Name: busybox
+          Image: busybox
+          EntryPoint:
+            - sh
+            - -c
+          Essential: true
+          Memory: 256
+          HealthCheck:
+            Command:
+              - "CMD-SHELL"
+              - "echo hello"
+            Interval: 5
+            Retries: 2
+            Timeout: 3  
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: ecs        
+          Environment:
+            - Name: 'Secret_Access_key'
+              Value: "je7MtGbClwBF/2Zp9Utk/h3yCo8nvbEXAMPLEKEY"    
+          Secrets:
+            - Name: 'secretmanager_token'
+              ValueFrom: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:my-token'        
+            - Name: 'parameterstore_token'
+              ValueFrom: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/apisecret'   
+          VolumesFrom:
+            - SourceContainer: simple-app-ec2
+          Command:
+            - >-
+              /bin/sh -c "while true; do echo '<html> <head> <title>Amazon ECS
+              Sample App</title> <style>body {margin-top: 40px;
+              background-color: #333;} </style> </head><body> <div
+              style=color:white;text-align:center> <h1>Amazon ECS Sample
+              App</h1> <h2>Congratulations!</h2> <p>Your application is now
+              running on a container in Amazon ECS.</p>' > top; /bin/date > date
+              ; echo '</div></body></html>' > bottom; cat top date bottom >
+              /usr/share/nginx/html/index.html ; echo $PROJECT > /usr/share/nginx/html/variable.html; sleep 10; done"
+      Volumes:
+        - Name: my-vol
+
+  EC2Service:
+    Type: AWS::ECS::Service
+    DependsOn: 
+    - AutoScalingGroup
+    Properties:
+      Cluster: !Ref EC2Cluster
+      DesiredCount: 1
+      ServiceName: sample-service-ec2
+      EnableExecuteCommand: true      
+      TaskDefinition: !Ref EC2TaskDefinition
+      LaunchType: EC2
+      Tags: 
+        - Key: Name
+          Value: EC2Cluster
+        - Key: Purpose
+          Value: Troubleshooting
+      PropagateTags: SERVICE
+
+Outputs:
+  ClusterName:
+    Value: !Ref EC2Cluster
+    Export:
+      Name: !Sub '${AWS::StackName}-MainCluster'
+
+  FargateClusterName:
+    Value: !Ref FargateCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-AdvancedCluster'
+
+  TaskExecutionRole:
+    Export:
+      Name: !Sub '${AWS::StackName}-TaskExecutionRoleRoleARN'
+    Value: !GetAtt TaskExecutionRole.Arn
+
+  EC2ContainerInstanceRole:
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2ContainerInstanceRoleARN'
+    Value: !GetAtt EC2Role.Arn
+
+  FargateTaskDefinition:
+    Export:
+      Name: !Sub '${AWS::StackName}-FargateTaskDefinition'
+    Value: !Ref FargateTaskDefinition
+
+  EC2TaskDefinition:
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2TaskDefinition'
+    Value: !Ref EC2TaskDefinition
+
+  PublicSubnet1:
+    Description: 'Public Subnet 1'
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub 'default-PublicSubnet1'    
