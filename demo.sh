@@ -22,7 +22,7 @@ echo $ECS_PUBLICSUBNET1_ID $TASK_EXECUTION_ROLE
 
 cat << EOF > runtime.json
 {
-    "family": "runtime",
+    "family": "ecsbootcamp",
     "executionRoleArn": "$TASK_EXECUTION_ROLE",
     "taskRoleArn": "$TASK_EXECUTION_ROLE",    
         "networkMode": "awsvpc",
